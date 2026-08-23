@@ -1,34 +1,91 @@
+import logging
+import os
+import tempfile
+from contextlib import asynccontextmanager
+
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from scrape import scrape_blogs
 from fastapi import FastAPI, HTTPException, Request
 import json
-import os
-import tempfile
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(
-    title="Blog API",
-    description="A simple API to fetch and search blogs from project516's blog.",
-    version="1.0.0",
+logger = logging.getLogger(__name__)
+
+BLOG_SOURCE_URL = (
+    "https://raw.githubusercontent.com/Project516/project516.github.io/"
+    "refs/heads/master/blog.html"
 )
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 _DEFAULT_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".blogapi")
 CACHE_FILE = os.environ.get(
     "BLOGAPI_CACHE_FILE", os.path.join(_DEFAULT_CACHE_DIR, "cache.json")
 )
 
-try:
-    with open(CACHE_FILE) as file:
-        cache = json.load(file)
-except FileNotFoundError:
-    cache = []
+
+def _load_cache() -> list[dict[str, str]]:
+    try:
+        with open(CACHE_FILE) as file:
+            loaded = json.load(file)
+        # Valid JSON can still be the wrong shape; treat anything that is not
+        # a list of records as an empty cache.
+        return loaded if isinstance(loaded, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+cache = _load_cache()
+
+
+def persist_cache(blogs: list[dict[str, str]]) -> None:
+    # Atomic write: write to a temp file in the same directory, then rename.
+    # This prevents symlink-following overwrites and partial reads.
+    cache_dir = os.path.dirname(CACHE_FILE) or "."
+    os.makedirs(cache_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=cache_dir, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as file:
+            json.dump(blogs, file)
+        os.replace(tmp_path, CACHE_FILE)
+    except BaseException:
+        os.unlink(tmp_path)
+        raise
+
+
+def refresh_cache() -> list[dict[str, str]]:
+    blogs = scrape_blogs(BLOG_SOURCE_URL)
+    persist_cache(blogs)
+    return blogs
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # A fresh deploy has no cache file, so every endpoint would serve an
+    # empty list until someone manually hits POST /blogs/cache. Scrape once
+    # at startup instead. Failure must not stop the server from booting.
+    if not cache:
+        try:
+            cache.extend(refresh_cache())
+        except Exception:
+            logger.warning(
+                "Could not populate blog cache at startup; POST /blogs/cache to retry.",
+                exc_info=True,
+            )
+    yield
+
+
+limiter = Limiter(key_func=get_remote_address)
+app = FastAPI(
+    title="Blog API",
+    description="A simple API to fetch and search blogs from project516's blog.",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -65,27 +122,13 @@ def search_blogs(request: Request, query: str) -> list[dict[str, str]] | dict[st
 def cache_blogs(request: Request) -> dict[str, str]:
     global cache
     try:
-        cache = scrape_blogs(
-            "https://raw.githubusercontent.com/Project516/project516.github.io/refs/heads/master/blog.html"
-        )
-    except Exception as e:
+        cache = refresh_cache()
+    except Exception:
+        logger.exception("Failed to refresh blog cache")
         raise HTTPException(
             status_code=500,
-            detail=f"Error occurred while scraping blogs: {str(e)}",
+            detail="Failed to refresh blog cache",
         )
-
-    # Atomic write: write to a temp file in the same directory, then rename.
-    # This prevents symlink-following overwrites and partial reads.
-    cache_dir = os.path.dirname(CACHE_FILE) or "."
-    os.makedirs(cache_dir, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=cache_dir, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as file:
-            json.dump(cache, file)
-        os.replace(tmp_path, CACHE_FILE)
-    except BaseException:
-        os.unlink(tmp_path)
-        raise
     return {"message": "Blogs cached successfully"}
 
 

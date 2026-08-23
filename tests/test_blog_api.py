@@ -5,7 +5,7 @@ tests, and the module-level ``cache`` is reset between every API test so the
 endpoints are exercised against known, fixed data.
 """
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import json
 
@@ -70,7 +70,22 @@ class _FakeResponse:
 
 
 @pytest.fixture()
-def client():
+def no_startup_refresh():
+    """Stub main.refresh_cache so neither the lifespan hook nor the cache
+    endpoint ever touches the network. Tests that care configure the stub;
+    tests exercising the real refresh_cache just don't request this.
+    """
+    stub = MagicMock(return_value=[])
+    patcher = patch.object(main, "refresh_cache", stub)
+    patcher.start()
+    try:
+        yield stub
+    finally:
+        patcher.stop()
+
+
+@pytest.fixture()
+def client(no_startup_refresh):
     """A TestClient with the rate limiter disabled so tests stay stable.
 
     slowapi counts hits per remote address, and a tight test run would trip
@@ -81,6 +96,9 @@ def client():
     main.limiter.enabled = False
     try:
         with TestClient(main.app) as test_client:
+            # Startup already consumed one refresh call; drop it so per-test
+            # call-count assertions see only what the test itself triggered.
+            no_startup_refresh.reset_mock()
             yield test_client
     finally:
         main.limiter.enabled = original_enabled
@@ -201,34 +219,88 @@ def test_search_blogs_matches_partial_title(client):
     assert len(response.json()) == 2
 
 
-def test_cache_endpoint_refreshes_and_persists(tmp_path, client):
-    """POST /blogs/cache calls scrape_blogs, stores the result, and writes it
-    to the cache file so a later process start can reload it."""
+def test_load_cache_rejects_valid_json_that_is_not_a_list(tmp_path):
+    """A truthy dict in the cache file must not skip the startup refresh or
+    break cache[0]; it is treated as an empty cache."""
+    bad = tmp_path / "cache.json"
+    bad.write_text('{"invalid": true}')
+    with patch("main.CACHE_FILE", str(bad)):
+        assert main._load_cache() == []
+
+
+def test_refresh_cache_scrapes_and_persists(tmp_path):
+    """refresh_cache scrapes, writes the payload to CACHE_FILE, and returns it."""
     cache_file = tmp_path / "cache.json"
     fake_blogs = [
         {"title": "Fresh", "link": "https://project516.dev/fresh", "date": "2026-09-01"}
     ]
     with (
-        patch("main.scrape_blogs", return_value=fake_blogs) as mock_scrape,
+        patch("main.scrape_blogs", return_value=fake_blogs),
         patch("main.CACHE_FILE", str(cache_file)),
     ):
-        response = client.post("/blogs/cache")
+        result = main.refresh_cache()
 
-    assert response.status_code == 200
-    assert response.json() == {"message": "Blogs cached successfully"}
-    mock_scrape.assert_called_once()
-    assert main.cache == fake_blogs
-    # Verify the cache file was actually written with the serialized payload.
+    assert result == fake_blogs
     assert cache_file.exists()
     with open(cache_file, "r") as f:
         assert json.load(f) == fake_blogs
 
 
-def test_cache_endpoint_returns_500_on_scrape_failure(client):
-    with patch("main.scrape_blogs", side_effect=RuntimeError("boom")):
+def test_cache_endpoint_refreshes_from_stub(client, no_startup_refresh):
+    """POST /blogs/cache stores whatever refresh_cache returns."""
+    no_startup_refresh.return_value = [
+        {"title": "Fresh", "link": "https://project516.dev/fresh", "date": "2026-09-01"}
+    ]
+    response = client.post("/blogs/cache")
+
+    assert response.status_code == 200
+    assert response.json() == {"message": "Blogs cached successfully"}
+    no_startup_refresh.assert_called_once()
+    assert main.cache == no_startup_refresh.return_value
+
+
+def test_cache_endpoint_returns_generic_500_without_leaking_details(
+    client, no_startup_refresh
+):
+    """The 500 detail must not echo exception text back to the client (#9)."""
+    no_startup_refresh.side_effect = RuntimeError("boom secret stuff")
+    with patch.object(main, "CACHE_FILE", "/nonexistent/cache.json"):
         response = client.post("/blogs/cache")
     assert response.status_code == 500
-    assert "boom" in response.json()["detail"]
+    assert response.json()["detail"] == "Failed to refresh blog cache"
+    assert "boom" not in response.text
+
+
+def test_startup_populates_empty_cache(no_startup_refresh):
+    """A fresh deploy has no cache file, so the lifespan hook must fill the
+    cache itself instead of serving [] until a manual POST."""
+    no_startup_refresh.return_value = [
+        {"title": "Boot", "link": "https://project516.dev/boot", "date": "2026-08-23"}
+    ]
+    with TestClient(main.app):
+        pass
+    no_startup_refresh.assert_called_once()
+    assert len(main.cache) == 1
+
+
+def test_startup_skips_refresh_when_cache_loaded_from_disk(no_startup_refresh):
+    """If the cache file existed at import time, startup must not re-scrape."""
+    main.cache = list(EXPECTED_BLOGS)
+    try:
+        with TestClient(main.app):
+            pass
+    finally:
+        main.cache = []
+    no_startup_refresh.assert_not_called()
+
+
+def test_startup_survives_refresh_failure(no_startup_refresh):
+    """An unreachable blog source must not stop the server from booting."""
+    no_startup_refresh.side_effect = RuntimeError("network down")
+    with TestClient(main.app) as test_client:
+        response = test_client.get("/blogs")
+    assert response.status_code == 200
+    assert response.json() == []
 
 
 # --- landing page -----------------------------------------------------------

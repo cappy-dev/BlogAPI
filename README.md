@@ -16,7 +16,7 @@ Simple API for my [blog website](https://project516.dev/blog)!
 
 ### POST:
 
-`POST /blogs/cache` - updates the blog cache.
+`POST /blogs/cache` - updates the blog cache. When the cache loads empty, startup attempts one refresh; if that fails the API starts with an empty cache and this endpoint can retry it.
 
 ### Docs:
 
