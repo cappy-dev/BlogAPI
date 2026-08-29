@@ -20,7 +20,9 @@ BLOG_SOURCE_URL = (
     "refs/heads/master/blog.html"
 )
 
-_DEFAULT_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".blogapi")
+# tempfile.gettempdir() rather than the home directory: serverless hosts
+# (e.g. Vercel) run with no writable HOME, but always give you a scratch /tmp.
+_DEFAULT_CACHE_DIR = os.path.join(tempfile.gettempdir(), "blogapi")
 CACHE_FILE = os.environ.get(
     "BLOGAPI_CACHE_FILE", os.path.join(_DEFAULT_CACHE_DIR, "cache.json")
 )
@@ -57,7 +59,13 @@ def persist_cache(blogs: list[dict[str, str]]) -> None:
 
 def refresh_cache() -> list[dict[str, str]]:
     blogs = scrape_blogs(BLOG_SOURCE_URL)
-    persist_cache(blogs)
+    # The disk cache is a warm-start optimization, not the source of truth.
+    # A scrape that succeeds should still update the in-memory cache even if
+    # the filesystem is unwritable (e.g. a read-only serverless instance).
+    try:
+        persist_cache(blogs)
+    except OSError:
+        logger.warning("Could not persist blog cache to disk", exc_info=True)
     return blogs
 
 
